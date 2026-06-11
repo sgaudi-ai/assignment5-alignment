@@ -7,6 +7,9 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
+from torch.distributions import Categorical
+from torch.nn.utils import clip_grad_norm_
+
 
 
 
@@ -46,7 +49,22 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    prompt_tokens = tokenizer(prompt_strs,padding=False,add_special_tokens=False)
+    output_tokens = tokenizer(output_strs,padding=False,add_special_tokens=False)
+    input_ids = [p+r for p,r in zip(prompt_tokens['input_ids'],output_tokens['input_ids'])]
+    max_pad = [tokenizer.pad_token_id]* max([len(i) for i in input_ids])
+    response_mask = [[0]*len(p) + [1]*len(r) + max_pad[len(p)+len(r): ] for p,r in zip(prompt_tokens['input_ids'],output_tokens['input_ids'])]
+    input_ids = [i + max_pad[len(i): ]  for i in input_ids ]
+    labels =     [i[1:]  for i in input_ids ]
+    response_mask =  [r[1:]  for r in response_mask ]
+    input_ids =  [i[:-1]  for i in input_ids ]
+    return {
+        "input_ids": torch.tensor(input_ids),
+        "response_mask": torch.tensor(response_mask),
+        "labels": torch.tensor(labels)
+    }
+    
+ 
 
 
 def run_get_response_log_probs(
@@ -82,7 +100,23 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    logits = model(input_ids).logits
+    p_theta_x_t_giv_x_less_t = torch.softmax(logits,dim=-1)
+    log_p_theta_x_t_giv_x_less_t = torch.log(p_theta_x_t_giv_x_less_t)
+    B,S,_ = log_p_theta_x_t_giv_x_less_t.shape
+    return_dict = {
+
+        "log_probs": log_p_theta_x_t_giv_x_less_t.reshape(B*S,-1)[torch.arange(0,B*S),labels.reshape(B*S)].reshape(B,S),
+    }   
+    if return_token_entropy:
+        return_dict["token_entropy"] = -1*(p_theta_x_t_giv_x_less_t * log_p_theta_x_t_giv_x_less_t).sum(dim=-1)
+    return return_dict
+
+    
+
+    
+
+    
 
 
 def run_compute_rollout_rewards(
@@ -114,7 +148,14 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    reward_dict = [reward_fn(resp,gt) for resp,gt in zip(rollout_responses,repeated_ground_truths )]
+    raw_rewards = torch.tensor([x["reward"] for x in reward_dict])
+    metadata = {
+        "mean_total": raw_rewards.mean().item(),
+        "mean_format":torch.tensor([x["format_reward"] for x in reward_dict]).mean().item()
+    }
+    return raw_rewards,metadata 
+
 
 
 def run_compute_group_normalized_rewards(
@@ -153,7 +194,25 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    raw_rewards = raw_rewards.reshape(-1,group_size) 
+    advantages = raw_rewards
+    mean_rewards = None
+    if baseline == "mean" or advantage_normalizer=="mean":
+        mean_rewards = raw_rewards.mean(dim=-1)
+    if baseline == "mean":
+        advantages = advantages - mean_rewards
+    if advantage_normalizer == "std":
+        std_rewards = raw_rewards.std(dim=-1)
+        advantages = advantages / (std_rewards + advantage_eps)
+    if advantage_normalizer == "mean":
+        advantages = advantages / (mean_rewards+ advantage_eps)
+    return advantages.reshape(-1,1), {}
+
+
+
+
+        
+
 
 
 def run_compute_policy_gradient_loss(
@@ -200,7 +259,7 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    return -1*raw_rewards_or_advantages*policy_log_probs,{}
 
 
 def run_aggregate_loss_across_microbatch(
@@ -232,7 +291,12 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    loss= (per_token_policy_gradient_loss *mask)
+    if loss_normalization == "sequence":
+        loss = (loss.sum(dim=-1) / mask.sum(dim=-1)).mean()
+    if  loss_normalization == "constant":
+        loss = loss.mean() /normalization_constant
+    return loss
 
 
 def run_grpo_train_step(
@@ -321,14 +385,30 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    tokenized_dict = run_tokenize_prompt_and_output(repeated_prompts, rollout_responses,tokenizer)
+    input_ids, labels,response_mask = tokenized_dict["input_ids"].to(model.device), tokenized_dict["labels"].to(model.device),tokenized_dict["response_mask"].to(model.device)
+    microbatch_size = len(input_ids) // gradient_accumulation_steps
+    batch_loss = 0
+    for i in range(0, len(input_ids), microbatch_size):
+        log_probs = run_get_response_log_probs(model,input_ids[i:i+microbatch_size] , labels[i:i+microbatch_size],return_token_entropy= False)
+        raw_rewards,metadata = run_compute_rollout_rewards(reward_fn, rollout_responses[i:i+microbatch_size],repeated_ground_truths[i:i+microbatch_size])
+        advantage, advantage_metadata = run_compute_group_normalized_rewards(raw_rewards.to(model.device), group_size,baseline=baseline,advantage_normalizer=advantage_normalizer,advantage_eps=advantage_eps)     
+        per_token_policy_gradient_loss, per_token_metadata = run_compute_policy_gradient_loss(advantage,log_probs["log_probs"],response_mask=response_mask[i:i+microbatch_size],importance_reweighting_method= importance_reweighting_method, old_log_probs=old_log_probs, cliprange=cliprange)
+        loss = run_aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask[i:i+microbatch_size],loss_normalization=loss_normalization,normalization_constant=normalization_constant)
+        # Backward pass.
+        loss.backward()
+        batch_loss +=loss
 
+    grad_norm = clip_grad_norm_(
+        model.parameters(),
+        max_norm=max_grad_norm
+    )
 
-"""
-The below adapters are used in the optional 
-RLHF / safety part of the Alignment assignment.
-"""
-
+    # Update weights once across entire batch.
+    optimizer.step()
+    # Zero gradients once across entire batch.
+    optimizer.zero_grad()
+    return batch_loss/gradient_accumulation_steps, {}
 
 def get_packed_sft_dataset(
     tokenizer: PreTrainedTokenizerBase,
