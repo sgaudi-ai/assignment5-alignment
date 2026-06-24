@@ -53,7 +53,7 @@ def run_tokenize_prompt_and_output(
     output_tokens = tokenizer(output_strs,padding=False,add_special_tokens=False)
     input_ids = [p+r for p,r in zip(prompt_tokens['input_ids'],output_tokens['input_ids'])]
     max_pad = [tokenizer.pad_token_id]* max([len(i) for i in input_ids])
-    response_mask = [[0]*len(p) + [1]*len(r) + max_pad[len(p)+len(r): ] for p,r in zip(prompt_tokens['input_ids'],output_tokens['input_ids'])]
+    response_mask = [[0]*len(p) + [1]*len(r) + [0]*len(max_pad[len(p)+len(r): ]) for p,r in zip(prompt_tokens['input_ids'],output_tokens['input_ids'])]
     input_ids = [i + max_pad[len(i): ]  for i in input_ids ]
     labels =     [i[1:]  for i in input_ids ]
     response_mask =  [r[1:]  for r in response_mask ]
@@ -101,8 +101,8 @@ def run_get_response_log_probs(
                 return_token_entropy=True).
     """
     logits = model(input_ids).logits
-    p_theta_x_t_giv_x_less_t = torch.softmax(logits,dim=-1)
-    log_p_theta_x_t_giv_x_less_t = torch.log(p_theta_x_t_giv_x_less_t)
+    log_p_theta_x_t_giv_x_less_t =  torch.log_softmax(logits, dim=-1)
+    p_theta_x_t_giv_x_less_t = torch.exp(log_p_theta_x_t_giv_x_less_t)
     B,S,_ = log_p_theta_x_t_giv_x_less_t.shape
     return_dict = {
 
@@ -149,10 +149,13 @@ def run_compute_rollout_rewards(
                 and format rewards over the rollout batch.
     """
     reward_dict = [reward_fn(resp,gt) for resp,gt in zip(rollout_responses,repeated_ground_truths )]
-    raw_rewards = torch.tensor([x["reward"] for x in reward_dict])
+    raw_rewards = torch.tensor([x["answer_reward"]*0.75 +x["format_reward"] *0.25  for x in reward_dict])
     metadata = {
         "mean_total": raw_rewards.mean().item(),
-        "mean_format":torch.tensor([x["format_reward"] for x in reward_dict]).mean().item()
+        "mean_format":torch.tensor([x["format_reward"] for x in reward_dict]).mean().item(),
+        "mean_answer": torch.tensor([x["answer_reward"] for x in reward_dict]).mean().item(),
+        "raw_rewards": raw_rewards,
+        "count": len(reward_dict)
     }
     return raw_rewards,metadata 
 
@@ -198,15 +201,15 @@ def run_compute_group_normalized_rewards(
     advantages = raw_rewards
     mean_rewards = None
     if baseline == "mean" or advantage_normalizer=="mean":
-        mean_rewards = raw_rewards.mean(dim=-1)
+        mean_rewards = raw_rewards.mean(dim=-1, keepdim=True)
     if baseline == "mean":
         advantages = advantages - mean_rewards
     if advantage_normalizer == "std":
-        std_rewards = raw_rewards.std(dim=-1)
-        advantages = advantages / (std_rewards + advantage_eps)
+        std_rewards = raw_rewards.std(unbiased=False, dim=-1, keepdim=True)
+        advantages = advantages / std_rewards.clamp_min(1e-6)
     if advantage_normalizer == "mean":
-        advantages = advantages / (mean_rewards+ advantage_eps)
-    return advantages.reshape(-1,1), {}
+        advantages = advantages / mean_rewards.clamp_min(1e-6)
+    return advantages.reshape(-1,1), {"advantages": advantages.reshape(-1,1)}
 
 
 
@@ -388,16 +391,31 @@ def run_grpo_train_step(
     tokenized_dict = run_tokenize_prompt_and_output(repeated_prompts, rollout_responses,tokenizer)
     input_ids, labels,response_mask = tokenized_dict["input_ids"].to(model.device), tokenized_dict["labels"].to(model.device),tokenized_dict["response_mask"].to(model.device)
     microbatch_size = len(input_ids) // gradient_accumulation_steps
+    
     batch_loss = 0
+    rewards = 0
+    advantage_metadata,per_token_metadata ={},{}
     for i in range(0, len(input_ids), microbatch_size):
         log_probs = run_get_response_log_probs(model,input_ids[i:i+microbatch_size] , labels[i:i+microbatch_size],return_token_entropy= False)
-        raw_rewards,metadata = run_compute_rollout_rewards(reward_fn, rollout_responses[i:i+microbatch_size],repeated_ground_truths[i:i+microbatch_size])
-        advantage, advantage_metadata = run_compute_group_normalized_rewards(raw_rewards.to(model.device), group_size,baseline=baseline,advantage_normalizer=advantage_normalizer,advantage_eps=advantage_eps)     
-        per_token_policy_gradient_loss, per_token_metadata = run_compute_policy_gradient_loss(advantage,log_probs["log_probs"],response_mask=response_mask[i:i+microbatch_size],importance_reweighting_method= importance_reweighting_method, old_log_probs=old_log_probs, cliprange=cliprange)
-        loss = run_aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask[i:i+microbatch_size],loss_normalization=loss_normalization,normalization_constant=normalization_constant)
-        # Backward pass.
+        raw_rewards,rewards_metadata = run_compute_rollout_rewards(reward_fn, rollout_responses[i:i+microbatch_size],repeated_ground_truths[i:i+microbatch_size])
+        if raw_rewards.std(unbiased=False) < 1e-5:
+            loss = log_probs["log_probs"].sum() * 0.0
+        else:
+            advantage, advantage_metadata = run_compute_group_normalized_rewards(raw_rewards.to(model.device), group_size,baseline=baseline,advantage_normalizer=advantage_normalizer,advantage_eps=advantage_eps)     
+            per_token_policy_gradient_loss, per_token_metadata = run_compute_policy_gradient_loss(advantage,log_probs["log_probs"],response_mask=response_mask[i:i+microbatch_size],importance_reweighting_method= importance_reweighting_method, old_log_probs=old_log_probs, cliprange=cliprange)
+            per_token_policy_gradient_loss = torch.nan_to_num(
+                    per_token_policy_gradient_loss,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            loss = run_aggregate_loss_across_microbatch(per_token_policy_gradient_loss,response_mask[i:i+microbatch_size],loss_normalization=loss_normalization,normalization_constant=normalization_constant)*microbatch_size / len(input_ids)
+        
         loss.backward()
-        batch_loss +=loss
+        with torch.no_grad():
+            rewards += raw_rewards.sum().item()
+            batch_loss +=loss.item()
+
 
     grad_norm = clip_grad_norm_(
         model.parameters(),
@@ -408,7 +426,16 @@ def run_grpo_train_step(
     optimizer.step()
     # Zero gradients once across entire batch.
     optimizer.zero_grad()
-    return batch_loss/gradient_accumulation_steps, {}
+
+    with torch.no_grad():
+        all_metadata = {
+            "rewards_metadata": rewards_metadata,
+            "advantage_metadata":advantage_metadata,
+            "per_token_metadata":per_token_metadata,
+            "batch_loss":batch_loss/gradient_accumulation_steps,
+            "rewards": rewards / len(input_ids)
+        }
+    return batch_loss/gradient_accumulation_steps, all_metadata
 
 def get_packed_sft_dataset(
     tokenizer: PreTrainedTokenizerBase,

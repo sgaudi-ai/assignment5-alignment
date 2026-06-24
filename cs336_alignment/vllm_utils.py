@@ -12,6 +12,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -38,6 +39,7 @@ class VLLMServer:
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
+    quantization: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.base_url = f"http://{self.host}:{self.port}"
@@ -56,6 +58,7 @@ class VLLMServer:
                 load_format=self.load_format,
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                quantization = self.quantization
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -122,6 +125,8 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    quantization: Optional[str] = None
+
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -147,8 +152,13 @@ def start_server(
         "--weight-transfer-config",
         json.dumps({"backend": "nccl"}),
         "--load-format",
-        load_format,
+        load_format
     ]
+    if quantization:
+        command +=[
+            "--quantization",
+            quantization
+        ]
     logger.info("Starting vLLM server: %s", " ".join(command))
     return subprocess.Popen(command, env=env, start_new_session=True)
 

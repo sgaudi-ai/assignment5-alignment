@@ -14,6 +14,9 @@ dependencies = [
     "transformers>=4.50.0",
     "typer>=0.15.4",
     "xopen>=2.0.2",
+    "flash-attn>=2.8.3",
+    "bitsandbytes>=0.49.2",
+    "vllm",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +26,6 @@ gpu = [
     # community cp312/cu12/Torch 2.10 wheel to avoid source builds on Modal.
     "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
-    "vllm==0.19.1",
     "wandb>=0.26.0",
 ]
 plots = [
