@@ -24,6 +24,7 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    logprobs: torch.Tensor
 
 
 @dataclass
@@ -35,7 +36,7 @@ class VLLMServer:
     seed: int = 0
     load_format: str = "auto"
     logging_level: str = "ERROR"
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.8
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -207,10 +208,13 @@ def generate_completions(
             "model": model_id,
             "prompt": prompt_batch,
             "temperature": sampling_params["temperature"],
-            "max_tokens": sampling_params["max_tokens"],
+            "max_tokens": sampling_params["max_new_tokens"],
             "n": sampling_params["n"],
             "seed": sampling_params["seed"],
             "return_token_ids": True,
+            "echo": True,
+            "logprobs": sampling_params["logprobs"],
+            "skip_special_tokens": sampling_params["skip_special_tokens"],
         }
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
@@ -223,6 +227,7 @@ def generate_completions(
                 text=choice["text"],
                 token_ids=choice.get("token_ids") or [],
                 finish_reason=choice.get("finish_reason"),
+                logprobs=choice.get("logprobs").get("token_logprobs")[1:],
             )
             for choice in choices
         )

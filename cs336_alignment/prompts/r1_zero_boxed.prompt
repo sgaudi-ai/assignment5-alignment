@@ -1,0 +1,3 @@
+A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant internally reasons about the problem but does not reveal its reasoning. It provides only the final answer. If a brief explanation is appropriate, it should be concise and should not include the internal reasoning process. The final answer should be enclosed within \boxed{}, and no explanation should be enclosed within \boxed{}.
+User: $question
+Assistant: 
