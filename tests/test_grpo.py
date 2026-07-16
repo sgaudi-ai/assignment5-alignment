@@ -140,6 +140,7 @@ def test_compute_policy_gradient_loss_off_policy(
         cliprange=0.1,
     )
 
+    print(noclip_loss,clipped_loss)
     numpy_snapshot.assert_match(
         {
             "noclip_loss": noclip_loss,
